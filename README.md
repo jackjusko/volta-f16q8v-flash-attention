@@ -35,15 +35,15 @@ A useful way to picture the cache: FP16 keys are the index cards used to find re
 
 ## Prefill results
 
-The best measured full-prompt prefill rate was **738.30 tok/s at 32K** and **395.19 tok/s at 128K** with this kernel. The table below includes the two reference paths:
+Prefill was rechecked with the same `batch 4096` and `ubatch 2048` for every path. The validated 32-value Q8 loader is faster at 32K, then loses to the reference as contexts grow. The default dispatch keeps that win for 32K prefills and returns to llama.cpp's standard mixed-cache path at 64K and above.
 
-| Prompt length | FP16 K/V, ubatch 512 | Original FP16 K + Q8_0 V, ubatch 512 | This kernel, ubatch 2048 |
-|---:|---:|---:|---:|
-| 32,768 | 585.90 tok/s | 543.31 tok/s | **738.30 tok/s** |
-| 65,536 | 461.72 tok/s | 451.20 tok/s | **574.17 tok/s** |
-| 131,072 | 359.70 tok/s | 357.09 tok/s | **395.19 tok/s** |
+| Prompt length | FP16 K/V | Original FP16 K + Q8_0 V | Custom 32-value kernel, forced | Default dispatch |
+|---:|---:|---:|---:|---:|
+| 32,768 | 675.33 tok/s | 662.22 tok/s | **722.95 tok/s** | **722.95 tok/s** |
+| 65,536 | — | 583.71 tok/s average (563.19–604.23) | 541.49 tok/s | 584.42 tok/s, standard path |
+| 131,072 | 427.35 tok/s | 427.50 tok/s | 396.86 tok/s | standard path selected |
 
-The custom run used ubatch 2048; both reference runs used ubatch 512. Since ubatch affects prefill speed, these numbers compare the tested configurations and do **not** isolate the kernel's contribution by themselves. Decode used the same 2,048 generated tokens for each path and is the cleaner long-context comparison. The original Q8 prefill reference had one run; other table values use two runs. See [the full benchmark record](benchmarks/results.md) for deviations, local-window status, and caveats.
+Each value is a single `llama-bench` sample except the 65,536-token mixed-cache reference, which has two samples. Those two reference runs differed by about 7%, so the default 584.42 tok/s fallback is within the measured spread. The 131,072-token default uses the same standard path as the reference but was not rerun after adding the dispatch. See [the full benchmark record](benchmarks/results.md) for setup and caveats.
 
 ## What is included
 

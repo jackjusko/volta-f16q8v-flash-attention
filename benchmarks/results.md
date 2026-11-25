@@ -4,13 +4,15 @@ All throughput values are tokens/second. Hardware: Tesla V100 (SM70, 32,494 MiB 
 
 ## Full prompt prefill
 
-| Prompt tokens | FP16 K / FP16 V, ubatch 512 | Original FP16 K / Q8_0 V, ubatch 512 | Custom FP16 K / Q8_0 V, ubatch 2048 |
-|---:|---:|---:|---:|
-| 32,768 | 585.90 ± 0.96 | 543.31 (1 run) | 738.30 ± 4.39 |
-| 65,536 | 461.72 ± 10.98 | 451.20 (1 run) | 574.17 ± 15.43 |
-| 131,072 | 359.70 ± 0.21 | 357.09 (1 run) | 395.19 ± 1.77 |
+All paths below use `batch 4096`, `ubatch 2048`, Flash Attention enabled, and the same Q3_K_XL model. Throughput is end-to-end `llama-bench` prompt tokens/second. “Custom forced” selects the 32-value Q8 loader even where the default dispatcher now avoids it.
 
-The FP16 reference used two runs; the original Q8 reference log contains one run, so no standard deviation is available. The custom path used two runs. The original-reference and custom-path `ubatch` values differ, which is a confound: these results show the tested configurations, not an apples-to-apples kernel-only prefill comparison. The custom path's 2048 query-row ceiling is exercised at the configured upper bound; smaller ubatches (including 512) remain within the dispatch guard.
+| Prompt tokens | FP16 K / FP16 V | Original FP16 K / Q8_0 V | Custom forced | Default dispatcher |
+|---:|---:|---:|---:|---:|
+| 32,768 | 675.328 | 662.216 | **722.947** | **722.947** |
+| 65,536 | not measured | 583.707 mean (563.186, 604.227) | 541.491 | 584.425, standard mixed-cache path |
+| 131,072 | 427.353 | 427.500 | 396.861 | standard mixed-cache path selected; not rerun |
+
+Each cell is one timed sample, except the 65,536 mixed-cache mean, which averages two single-sample runs with a 7% spread. At 32K, the custom kernel is 9.2% faster than the original mixed-cache path and 7.1% faster than FP16. At 64K, forcing the custom loader is slower than the mixed-cache reference; the automatic dispatcher uses the standard path instead. The 128K forced custom result also trails both references, so the automatic dispatcher uses the standard path from 64K upward for the validated Qwen3.8 D=256/GQA=6 prefill shape. The threshold is conservative: 32K was tested as the custom win and 64K as the first loss. Small-query decode remains on the custom path.
 
 ## 2,048-token decode after a large prefill
 
@@ -26,6 +28,8 @@ At 128K total context, the custom result is 45% faster than the FP16/FP16 refere
 
 A separate 128-token run at 130,944 prefill depth measured 13.71 ± 0.58 tok/s for FP16/FP16, 11.40 ± 0.82 for original FP16/Q8_0, and 20.59 ± 0.21 for the custom path. It is separate from the 2K decode table and should not be directly compared as the same benchmark workload.
 
+The updated loader split was also checked with 2,048 generated tokens after a 65,536-token prefill, using `batch 4096` and `ubatch 2048`: custom FP16-K/Q8_0-V measured **23.110 tok/s** and the custom-path-disabled mixed-cache reference measured **16.691 tok/s**. This is one sample per path. The small-query decode tile keeps the original 8-value Q8 loader; the wider loader is compiled for prefill tiles.
+
 ## Local-window prefill status
 
 A matched-ubatch 20K-token prefill appended at a depth of about 54K measured 443.49 ± 9.24 tok/s for FP16/FP16 and 438.72 ± 6.60 for the original FP16/Q8_0 path at ubatch 2048. The custom-path run was interrupted before a result was recorded. No custom local-window number is claimed.
@@ -34,6 +38,6 @@ A matched-ubatch 20K-token prefill appended at a depth of about 54K measured 443
 
 - These numbers came from the Q3_K_XL model named above, not the later Q5_K_S model used for the running minion servers.
 - The reference build and custom build are the same source build label, with dispatch/type settings selecting paths; the original Q8 path and new path share cache dtype but use different attention kernels.
-- Full-prompt prefill reference vs custom uses ubatch 512 vs 2048. Interpret that table as configuration-level comparison, not solely a kernel effect.
+- The earlier prefill table used mismatched ubatches and has been replaced by matched `ubatch 2048` results above.
 - Benchmarks ran on a single V100. No other GPU or engine integration has been benchmarked here.
 - Correctness was checked in the llama.cpp backend tests and the kernel’s numerical tests during development; the results here record performance measurements, not independent verification of another engine's implementation.
