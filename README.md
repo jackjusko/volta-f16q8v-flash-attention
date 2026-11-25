@@ -1,71 +1,64 @@
-# Volta FlashAttention-style kernel: FP16 K + Q8_0 V
+# Faster long-context attention on NVIDIA V100
 
-A CUDA attention-kernel contribution and integration brief for serving engines that want an optimized mixed-precision KV-cache path on NVIDIA Volta (SM70, tested on Tesla V100).
+This project shares a CUDA attention kernel for a mixed-precision KV cache: **FP16 keys and Q8_0 values**. It was developed and measured on a Tesla V100 (Volta, SM70), with Qwen3.8 as the main target.
 
-This repository publishes the kernel source changes as a patch against llama.cpp, the benchmark record, and one integration prompt per serving engine. It does **not** ship a llama.cpp build, compiled binary, model, or turnkey plugin. The implementation is integrated into llama.cpp's existing attention template; its patch is the source of truth, and the prompts guide an outside coding agent through adapting the algorithm to another engine's own layouts and runtime.
+## The standout result
 
-## What the kernel computes
+At a 128K-token context, generating 2,048 tokens reached **19.66 tokens/second** with this kernel. In the same benchmark, FP16 keys and values reached 13.55 tokens/second, and the original FP16-key/Q8_0-value path reached 12.19 tokens/second.
 
-For each query head, causal attention is
+That is about **45% faster than the FP16 path** and **61% faster than the original mixed-cache path** in this test. The advantage grew with context length:
 
-\[
-S = \frac{QK^T}{\sqrt{d}} + M,\qquad P=\operatorname{softmax}(S),\qquad O=PV,
-\]
+| Total context | FP16 K/V | Original FP16 K + Q8_0 V | This kernel |
+|---:|---:|---:|---:|
+| 34,816 | 24.53 tok/s | 21.30 tok/s | **25.45 tok/s** |
+| 67,584 | 18.25 tok/s | 16.89 tok/s | **22.91 tok/s** |
+| 131,072 | 13.55 tok/s | 12.19 tok/s | **19.66 tok/s** |
 
-where `M` is the causal/additive mask. The reference llama.cpp op supplies Q in FP32 and converts each query tile to FP16 for tensor-core MMA; K is stored as FP16; V is stored as Q8_0. The benchmarked model used a 256-wide head and 24 query heads grouped over 4 KV heads (GQA ratio 6). Dispatch in the reference adapter also admits head dimensions 64 and 128, GQA ratios 2–8, and query batches up to 2048 when the other layout/mask/alignment guards match.
+Each run generated 2,048 tokens after a long prefill. The full results and measurement notes are in [benchmarks/results.md](benchmarks/results.md).
 
-“Q8_0” is a specific block format, not a generic synonym for INT8 KV: each 32-value block has a 16-bit scale and 32 signed 8-bit values. Its values are reconstructed as `v[i] = scale * q[i]`. This kernel reads each Q8_0 V block and widens small chunks to FP16 while staging an attention tile in shared memory. The tensor-core weighted-value product then consumes that tile. Keys remain FP16, so the score product does not pay a K dequantization step.
+## Why it helps
 
-## Step by step: one attention tile
+During generation, the model repeatedly looks back over the conversation so far. At long context, that means reading a large cache of past keys and values for every new token. This kernel keeps keys in FP16, but stores values in the smaller Q8_0 format. It expands only the small value blocks needed for the current calculation, instead of first converting the whole cache to FP16.
 
-1. **Choose a work tile.** The kernel assigns work across query rows, grouped query heads, and a block of KV positions. The reference path uses tiled MMA/WMMA operations and shared-memory staging. Larger query batches use a query tile suited to prefill; decode-sized batches select smaller tiles. This is why the dispatch is shape-aware rather than a single launch configuration.
-2. **Load Q and K.** Query rows and the current key block are staged in the layout expected by Volta tensor cores. The MMA computes a tile of dot products. Scaling and the causal/additive mask are applied before normalization. Invalid tail rows are guarded by the adapter's bounds checks.
-3. **Update softmax online.** The kernel does not build the full `sequence_length × sequence_length` score matrix. As each K block arrives, it tracks a running maximum `m`, normalization sum `l`, and weighted-value accumulator `a`. For a new score tile with maximum `m'`, it rescales the old state by `alpha = exp(m - max(m,m'))`, folds in the new tile's exponentials, and continues. At the end, `O = a/l` (with the implementation's existing numerical bookkeeping). This is the key long-context property: memory for intermediate attention scores is bounded by tile size rather than growing quadratically with context.
-4. **Load and expand Q8_0 values.** For the V tile only, each worker decodes Q8_0 scale/value chunks and writes FP16 values into shared memory using the swizzled tile layout. It expands only the tile currently needed; it does not convert the whole cache to FP16. The analogy is unpacking just the current page of a compressed book onto a desk, rather than photocopying the whole library.
-5. **Accumulate weighted V.** MMA multiplies the normalized probability tile by the staged V tile. A partial weighted sum is combined with prior KV tiles using the same online-softmax rescaling, then the final result is stored.
-6. **Dispatch only when safe.** The llama.cpp adapter checks SM70, data types, head dimensions, GQA ratio, query count (1–2048), contiguity/alignment, mask shape/type, and unsupported features such as nonzero softcap or extra inputs. Unsupported shapes use the engine's existing attention fallback. The environment variable `GGML_CUDA_VOLTA_F16Q8_FATTN_MMA_DISABLE` disables this route.
+The attention work is also done in tiles. The kernel processes a manageable slice of the past, keeps a running summary of which earlier tokens matter most, then moves to the next slice. It does not create a huge table of every query-to-token score. That keeps temporary memory small as context grows.
 
-A useful analogy: ordinary attention lays every question-to-token score card on a huge table, sorts and normalizes all of them, then revisits the values. Tiled online attention processes a stack of cards a handful at a time, keeps only the running normalization and weighted answer, and discards each score tile. Q8_0 is a compact shelf for V; the kernel expands only the cards' current shelf section when it needs to combine them.
+On V100, the kernel uses the GPU's tensor-core matrix operations for the main attention calculations. Together, the smaller value reads and tiled processing are the main reasons the long-context decode results improve.
 
-## Why this mixed cache can help
+## What happens, step by step
 
-For equal K and V widths, FP16 K plus Q8_0 V is about 3.06 bytes per KV element pair on average (2 bytes for K and 34/32 bytes for Q8_0 V), versus 4 bytes for FP16/FP16. That is about 23% less KV payload than FP16/FP16. It is not half-sized because keys stay FP16, and the Q8_0 scales add overhead. At long context, fewer V bytes moved can help bandwidth-bound decode; prefill can instead be limited by projection/GEMM work and tile scheduling. The measured gains below are specific to the stated V100/model/build/ubatch setup and should not be generalized without a same-shape benchmark.
+1. **Read the current query and a slice of past keys.** A query represents what the model is looking for. Keys help determine which past tokens are relevant. The reference implementation converts each query tile to FP16 for the tensor-core calculation and reads keys stored in FP16.
+2. **Score that slice.** The kernel compares the query with the keys, applies the causal mask so a token cannot see the future, and updates its running record of the strongest matches.
+3. **Read the matching value slice.** Values carry the information that gets brought forward. Each Q8_0 block contains 32 signed 8-bit values and one FP16 scale. The kernel applies that scale and expands only the current block into a shared-memory tile.
+4. **Add this slice to the running answer.** The kernel combines the slice's weighted values with the work from earlier slices, adjusting for the updated match strengths. Once all visible past tokens have been processed, it writes the final attention result.
 
-## Scope and compatibility
+A useful way to picture the cache: FP16 keys are the index cards used to find relevant pages; Q8_0 values are compact copies of the page contents. The kernel searches with the keys and opens only the value pages needed for each small step.
 
-- Hardware tested: NVIDIA Tesla V100, compute capability 7.0 (SM70), 32 GiB device.
-- Cache layout: FP16 K and llama.cpp-compatible Q8_0 V blocks. Other engines' INT8/FP8/FP8-E4M3/scaled formats need an explicit format adapter and numerical validation.
-- Reference dispatch shapes: D=64/128/256; GQA 2–8; query rows up to 2048; additional mask, layout, and alignment constraints apply.
-- Not a universal CUDA FlashAttention-2 drop-in. It is a FlashAttention-style tiled online-softmax path using the llama.cpp MMA attention machinery, with Q8_0 V tile decoding added. Several memory-layout and runtime details are host/backend-specific.
-- Long-context support does not imply every sequence length or scheduler shape is legal. In particular, padding, page tables, split-KV reduction, graph capture, sliding-window masks, sinks, softcaps, and ragged batches must be validated per serving engine.
+## Prefill results
 
-## Source and application
+The best measured full-prompt prefill rate was **738.30 tok/s at 32K** and **395.19 tok/s at 128K** with this kernel. The table below includes the two reference paths:
 
-`kernel/llama.cpp-volta-f16k-q8v.patch` is the source patch against llama.cpp base revision `90ce70c269d9037dcac6d885b724e9d82651b7f1` (build label `90ce70c26`). It changes only the CUDA attention source files needed for the mixed path; it does not include local tests or build products. Apply to that exact base to inspect the source in context. This is a reference integration, not a promise that the patch applies to later llama.cpp revisions without conflict.
+| Prompt length | FP16 K/V, ubatch 512 | Original FP16 K + Q8_0 V, ubatch 512 | This kernel, ubatch 2048 |
+|---:|---:|---:|---:|
+| 32,768 | 585.90 tok/s | 543.31 tok/s | **738.30 tok/s** |
+| 65,536 | 461.72 tok/s | 451.20 tok/s | **574.17 tok/s** |
+| 131,072 | 359.70 tok/s | 357.09 tok/s | **395.19 tok/s** |
 
-The patch deliberately reuses the existing generic FP16 MMA kernel and adds a Q8_0 V tile loader. This is useful reference code for ports, but a serving engine with a different cache representation or kernel DSL should adapt the algorithm rather than copy the ggml wrapper verbatim.
+The custom run used ubatch 2048; both reference runs used ubatch 512. Since ubatch affects prefill speed, these numbers compare the tested configurations and do **not** isolate the kernel's contribution by themselves. Decode used the same 2,048 generated tokens for each path and is the cleaner long-context comparison. The original Q8 prefill reference had one run; other table values use two runs. See [the full benchmark record](benchmarks/results.md) for deviations, local-window status, and caveats.
 
-## Benchmarks
+## What is included
 
-See [benchmarks/results.md](benchmarks/results.md) for test details and caveats. Short version: on a Tesla V100, the custom path reached 395.19 tok/s on a 131,072-token prompt versus 359.70 FP16/FP16 and 357.09 original FP16-K/Q8_0-V. For a 2,048-token decode at a 131,072-token total context, it reached 19.66 tok/s versus 13.55 and 12.19 tok/s respectively. The prefill comparison uses different `ubatch` settings for the original references (512) and custom kernel (2048), so the full-prompt speedup cannot be attributed to the kernel alone. Decode runs used the same 2,048 generated tokens and two repetitions per path.
+- `kernel/llama.cpp-volta-f16k-q8v.patch` — the CUDA source changes, against the recorded llama.cpp base revision.
+- `prompts/` — one integration task prompt each for vLLM, SGLang, TensorRT-LLM, Hugging Face TGI, LMDeploy, Ollama, Aphrodite Engine, and ExLlamaV2.
+- `benchmarks/results.md` — complete measured prefill and decode tables with setup details.
 
-## Engine integration prompts
+The patch is source code, not a compiled llama.cpp build. It adds Q8_0 value loading to llama.cpp's existing CUDA attention implementation, so it depends on that codebase's types and launch machinery. The other engine prompts ask an agent to inspect the engine's actual cache format and backend before porting; an engine's generic “INT8 KV” mode is not automatically compatible with Q8_0.
 
-The selected targets cover widely used self-hosted runtimes and CUDA-oriented serving stacks. Their interfaces and hardware matrices change; each prompt begins by asking the agent to verify the current checkout.
+## Supported path and limits
 
-| Prompt | Project |
-|---|---|
-| [vLLM](prompts/vllm.md) | [vllm-project/vllm](https://github.com/vllm-project/vllm) |
-| [SGLang](prompts/sglang.md) | [sgl-project/sglang](https://github.com/sgl-project/sglang) |
-| [TensorRT-LLM](prompts/tensorrt-llm.md) | [NVIDIA/TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) |
-| [Text Generation Inference](prompts/tgi.md) | [huggingface/text-generation-inference](https://github.com/huggingface/text-generation-inference) |
-| [LMDeploy](prompts/lmdeploy.md) | [InternLM/lmdeploy](https://github.com/InternLM/lmdeploy) |
-| [Ollama](prompts/ollama.md) | [ollama/ollama](https://github.com/ollama/ollama) |
-| [Aphrodite Engine](prompts/aphrodite.md) | [aphrodite-engine/aphrodite-engine](https://github.com/aphrodite-engine/aphrodite-engine) |
-| [ExLlamaV2 / successor](prompts/exllamav2.md) | [turboderp-org/exllamav2](https://github.com/turboderp-org/exllamav2) |
+The reference dispatch targets NVIDIA SM70, head dimensions 64, 128, or 256, grouped-query ratios 2–8, and query batches up to 2048 when the cache layout, alignment, mask, and other guards match. Unsupported shapes should use the engine's normal attention path. The llama.cpp path can be disabled with `GGML_CUDA_VOLTA_F16Q8_FATTN_MMA_DISABLE`.
 
-Each file in `prompts/` is a standalone task prompt for an outside coding agent. It asks the agent to inspect the current engine source, identify its actual cache and attention APIs, implement a guarded backend path, add correctness coverage, and measure performance against the engine's native references. The prompts are plans for ports; they do not claim that those integrations already exist or that every target supports SM70 today.
+This is a FlashAttention-style tiled kernel, not a universal drop-in implementation for every FlashAttention-2 backend. Page tables, split-KV scheduling, graph capture, other KV encodings, and newer GPU architectures need their own integration and validation.
 
-## Attribution
+## Source and license
 
-The reference patch is derived from ggml-org/llama.cpp, licensed under MIT. See [LICENSE](LICENSE). Benchmark values were collected locally with llama.cpp build `90ce70c26`; the exact source logs are available in the development environment, not vendored here.
+The patch targets llama.cpp revision `90ce70c269d9037dcac6d885b724e9d82651b7f1` (`90ce70c26`). It is derived from the MIT-licensed [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp); see [LICENSE](LICENSE).
