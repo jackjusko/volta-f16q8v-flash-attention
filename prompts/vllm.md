@@ -1,0 +1,11 @@
+# Integration task: vLLM
+
+You are integrating the Volta FP16-K/Q8_0-V tiled attention kernel in this repository into the current vLLM checkout. Read the root README, benchmark caveats, and `kernel/llama.cpp-volta-f16k-q8v.patch` first. The patch is a llama.cpp reference implementation, not a vLLM patch.
+
+1. Inspect the checked-out vLLM revision, supported CUDA architectures, attention backend registry, KV-cache dtype/quantization metadata, paged-cache layout, and current prefill/decode attention implementations. Identify whether SM70 is currently built and supported. Do not assume that vLLM's FP8/INT8 cache equals ggml Q8_0.
+2. Find the best extension point that preserves vLLM's scheduler, paged block tables, CUDA graph capture, prefix caching, and split-KV behavior. Determine whether the kernel should handle block-table gathers directly or whether a contiguous-cache adapter is feasible. Document the tradeoff.
+3. Port the algorithm: FP16 K dot products; Q8_0 V tile-only dequantization; online max/sum/output accumulation; causal/additive masks; supported GQA and query tiles. Match Q8_0's 32-value blocks and FP16 scale exactly, or explicitly introduce/validate a different cache encoding.
+4. Add explicit dispatch gates for SM70, compatible dtypes/layout/alignment, head dimensions 64/128/256, GQA 2–8, and query rows 1–2048. Unsupported cases must reliably fall back. Keep a runtime opt-out and do not change unrelated dispatch.
+5. Add tests against vLLM's reference attention for decode, short and long prefill, ragged batches, page boundaries, partial final pages, masks, and GQA. Use tolerances justified for Q8_0 and FP16 accumulation; test NaN/Inf and sanitizer behavior.
+6. Benchmark on a V100 against vLLM's FP16/FP16 and native FP16-K/Q8-V paths. Separate prompt processing and decode at 32K, 64K, and 128K contexts. Hold model, scheduler, batch, cache block size, and ubatch/query chunk fixed; include launch config, tokens/s, latency, and memory. Compare at multiple query chunk sizes through 2048.
+7. Report exact files changed, build flags/SM targets, tests and results, unsupported combinations, and an upstreamable patch. If present vLLM internals cannot safely support this path or SM70, explain the blocker and propose the smallest viable integration point; do not emulate success with a different cache format.

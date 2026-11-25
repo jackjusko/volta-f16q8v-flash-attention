@@ -1,0 +1,11 @@
+# Integration task: Ollama
+
+Explore integrating the Volta FP16-K/Q8_0-V attention algorithm into the current Ollama runtime. Read the root README and benchmark record. The included llama.cpp patch is a reference source change, not an Ollama patch.
+
+1. Inspect Ollama's current runner architecture and exact llama.cpp dependency revision, model runner selection, CUDA build flags, cache type handling, and attention dispatch. Determine whether a custom llama.cpp backend patch would be picked up by Ollama's build/release system and whether SM70 is currently built.
+2. Find the narrowest maintainable integration point: upstream llama.cpp patch, Ollama runner-owned kernel, or selectable CUDA backend. Preserve Ollama's model compatibility, API, scheduling, and runner lifecycle.
+3. Port or rebase the FP16 K + Q8_0 V path. Confirm whether Ollama's KV cache config can request FP16 K and Q8_0 V independently and whether its Q8_0 block layout matches the source. Do not confuse model weight quantization with KV-cache quantization.
+4. Guard dispatch on SM70 and supported dims 64/128/256, GQA 2–8, query rows through 2048, alignment and masks. Preserve fallback and add a kill switch. Verify cached model reuse and runner restarts don't mix cache formats.
+5. Add correctness tests through the lowest-level CUDA path plus an Ollama runner smoke test, covering decode, long prefill, causal mask, GQA, partial blocks, and outputs versus FP16 reference.
+6. Benchmark on a V100 if the official runner currently supports it; compare FP16/FP16, original FP16-K/Q8_0-V, and custom path at 32K/64K/128K with identical model, context, batch, and ubatch. Report server-level and kernel-level results separately.
+7. Provide a patch against the exact Ollama and llama.cpp revisions, test results, build flags, and any upstream coordination needed. If the current runner already incorporates this code, propose a clean rebase rather than duplicating it.
