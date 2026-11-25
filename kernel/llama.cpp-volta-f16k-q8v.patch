@@ -401,7 +401,7 @@ index 4137ce7da..c9210bc09 100644
  
  
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index c98e3908e..4791c238a 100644
+index c98e3908e..bac94ffd7 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -584,6 +584,32 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
@@ -481,7 +481,7 @@ index c98e3908e..4791c238a 100644
          float logit_softcap = 0.0f;
          memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
          if (logit_softcap == 0.0f) {
-@@ -770,6 +808,40 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -770,6 +808,41 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
          }
      }
  
@@ -490,7 +490,8 @@ index c98e3908e..4791c238a 100644
 +    // but loses to the standard mixed-cache path by 64K. Keep the optimized path for
 +    // decode and shorter prefills, and let the regular FA selector handle longer prefills.
 +    const bool volta_f16q8_long_prefill_fallback =
-+        Q->ne[0] == 256 && Q->ne[1] > 8 && Q->ne[2] == 24 && K->ne[2] == 4 && K->ne[1] >= 65536;
++        Q->ne[0] == 256 && Q->ne[1] > 8 && Q->ne[2] == 24 && K->ne[2] == 4 && K->ne[1] >= 65536 &&
++        !std::getenv("GGML_CUDA_VOLTA_F16Q8_TILE");
 +    if (cc == GGML_CUDA_CC_VOLTA && volta_mma_available(cc) &&
 +            !std::getenv("GGML_CUDA_VOLTA_F16Q8_FATTN_MMA_DISABLE") &&
 +            !volta_f16q8_long_prefill_fallback &&
@@ -522,7 +523,7 @@ index c98e3908e..4791c238a 100644
      if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
          // Opt-in A/B for Qwen3.8-Flash-Next QSA decode (Q tokens = 1, GQA_eff ~ 4 → TILE).
          // DECODE_MMA: force WMMA even when the tile is "too small" for Volta TC.
-@@ -866,6 +938,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -866,6 +939,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
          case BEST_FATTN_KERNEL_VOLTA_Q8_W4:
              GGML_ABORT("unreachable");
              break;
@@ -530,7 +531,7 @@ index c98e3908e..4791c238a 100644
          case BEST_FATTN_KERNEL_NONE:
              break;
      }
-@@ -893,6 +966,18 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -893,6 +967,18 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
          case BEST_FATTN_KERNEL_VOLTA_Q8_W4:
              ggml_q8v::launch(ctx, dst);
              break;

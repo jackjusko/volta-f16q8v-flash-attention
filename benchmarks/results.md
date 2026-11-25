@@ -14,6 +14,8 @@ All paths below use `batch 4096`, `ubatch 2048`, Flash Attention enabled, and th
 
 Each cell is one timed sample, except the 65,536 mixed-cache mean, which averages two single-sample runs with a 7% spread. At 32K, the custom kernel is 9.2% faster than the original mixed-cache path and 7.1% faster than FP16. At 64K, forcing the custom loader is slower than the mixed-cache reference; the automatic dispatcher uses the standard path instead. The 128K forced custom result also trails both references, so the automatic dispatcher uses the standard path from 64K upward for the validated Qwen3.8 D=256/GQA=6 prefill shape. The threshold is conservative: 32K was tested as the custom win and 64K as the first loss. Small-query decode remains on the custom path.
 
+A same-build 64K custom tile screen compared the default 16-query × 2-head tile (541.491 tok/s) with a 32-query × 1-head tile (519.027 tok/s). Both used the validated 32-value loader and 32-row KV step; the default tile remained faster. The 32-query tile result is exploratory and does not affect dispatch.
+
 ## 2,048-token decode after a large prefill
 
 The depth column is llama-bench's pre-generation context depth. “Total context” adds the 2,048 generated tokens. Each configuration had two depth/generation repetitions.
