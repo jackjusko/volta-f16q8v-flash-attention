@@ -35,15 +35,15 @@ A useful way to picture the cache: FP16 keys are the index cards used to find re
 
 ## Prefill results
 
-Prefill was rechecked with the same `batch 4096` and `ubatch 2048` for every path. The validated 32-value Q8 loader is faster at 32K, then loses to the reference as contexts grow. The default dispatch keeps that win for 32K prefills and returns to llama.cpp's standard mixed-cache path at 64K and above.
+Prefill uses `batch 4096` and `ubatch 2048`. The latest two-run measurements show the new path winning at 32K; at 64K and above, the standard mixed-cache path is faster, so the default dispatcher switches back to it.
 
-| Prompt length | FP16 K/V | Original FP16 K + Q8_0 V | Custom 32-value kernel, forced | Default dispatch |
+| Prompt length | FP16 K/V | Original FP16 K + Q8_0 V | New path forced | Hybrid default dispatch |
 |---:|---:|---:|---:|---:|
-| 32,768 | 675.33 tok/s | 662.22 tok/s | **722.95 tok/s** | **722.95 tok/s** |
-| 65,536 | — | 583.71 tok/s average (563.19–604.23) | 541.49 tok/s | 584.42 tok/s, standard path |
-| 131,072 | 427.35 tok/s | 427.50 tok/s | 396.86 tok/s | standard path selected |
+| 32,768 | 675.33 tok/s | 662.22 tok/s | **738.30 ± 4.39 tok/s** | Same new-path sample; default route not separately retimed |
+| 65,536 | — | 583.71 tok/s mean (563.19–604.23) | 574.17 ± 15.43 tok/s | 584.43 tok/s, standard path |
+| 131,072 | 427.35 tok/s | 427.50 tok/s | 395.19 ± 1.77 tok/s | standard path selected; not retimed |
 
-Each value is a single `llama-bench` sample except the 65,536-token mixed-cache reference, which has two samples. Those two reference runs differed by about 7%, so the default 584.42 tok/s fallback is within the measured spread. The 131,072-token default uses the same standard path as the reference but was not rerun after adding the dispatch. See [the full benchmark record](benchmarks/results.md) for setup and caveats.
+The 32K reference values are single samples; the new-path result averages two runs. The 65K mixed-cache mean combines two single-sample runs with a 7% spread; other reference cells are single samples. At 32K the new path beats the original mixed-cache result by 11.5%, and the default route selects that path, though we did not retime after changing dispatch. Forced use loses at 64K and 128K, so the dispatcher selects llama.cpp's standard mixed-cache path at 64K and above. The 128K default was not retimed after the dispatch change. See [the full benchmark record](benchmarks/results.md) for setup and caveats.
 
 ## What is included
 

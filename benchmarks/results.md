@@ -4,17 +4,17 @@ All throughput values are tokens/second. Hardware: Tesla V100 (SM70, 32,494 MiB 
 
 ## Full prompt prefill
 
-All paths below use `batch 4096`, `ubatch 2048`, Flash Attention enabled, and the same Q3_K_XL model. Throughput is end-to-end `llama-bench` prompt tokens/second. “Custom forced” selects the 32-value Q8 loader even where the default dispatcher now avoids it.
+All paths below use `batch 4096`, `ubatch 2048`, Flash Attention enabled, and the same Q3_K_XL model. Throughput is end-to-end `llama-bench` prompt tokens/second. “New kernel forced” selects the 32-value Q8 loader even where the default dispatcher now avoids it.
 
-| Prompt tokens | FP16 K / FP16 V | Original FP16 K / Q8_0 V | Custom forced | Default dispatcher |
+| Prompt tokens | FP16 K / FP16 V | Original FP16 K / Q8_0 V | New kernel forced | Hybrid default dispatch |
 |---:|---:|---:|---:|---:|
-| 32,768 | 675.328 | 662.216 | **722.947** | **722.947** |
-| 65,536 | not measured | 583.707 mean (563.186, 604.227) | 541.491 | 584.425, standard mixed-cache path |
-| 131,072 | 427.353 | 427.500 | 396.861 | standard mixed-cache path selected; not rerun |
+| 32,768 | 675.328 | 662.216 | **738.30 ± 4.39** | Same new-path sample; default route not separately retimed |
+| 65,536 | not measured | 583.707 mean (563.186, 604.227) | 574.17 ± 15.43 | 584.425, standard path |
+| 131,072 | 427.353 | 427.500 | 395.19 ± 1.77 | standard path selected; not retimed |
 
-Each cell is one timed sample, except the 65,536 mixed-cache mean, which averages two single-sample runs with a 7% spread. At 32K, the custom kernel is 9.2% faster than the original mixed-cache path and 7.1% faster than FP16. At 64K, forcing the custom loader is slower than the mixed-cache reference; the automatic dispatcher uses the standard path instead. The 128K forced custom result also trails both references, so the automatic dispatcher uses the standard path from 64K upward for the validated Qwen3.8 D=256/GQA=6 prefill shape. The threshold is conservative: 32K was tested as the custom win and 64K as the first loss. Small-query decode remains on the custom path.
+The 32K FP16 and original mixed-cache numbers are single samples; the new-kernel result is the mean of two runs. The 65K mixed-cache value averages two single-sample runs with a 7% spread. Other reference cells are single samples. At 32K the new path is 11.5% faster than the original mixed-cache result and 9.3% faster than FP16. The default route selects that new path, but its throughput cell reuses the forced-path sample rather than a separate post-change run. The forced new path is slower at 64K and 128K, so hybrid dispatch returns to the standard mixed-cache path at 64K and above for the measured Qwen3.8 D=256/GQA=6 shape. The 128K default path was not retimed after the dispatch change.
 
-A same-build 64K custom tile screen compared the default 16-query × 2-head tile (541.491 tok/s) with a 32-query × 1-head tile (519.027 tok/s). Both used the validated 32-value loader and 32-row KV step; the default tile remained faster. The 32-query tile result is exploratory and does not affect dispatch.
+A same-build exploratory 64K tile screen compared the 16-query × 2-head tile (541.491 tok/s) with a 32-query × 1-head tile (519.027 tok/s). Both used the 32-value loader and 32-row KV step. This earlier single-run screen does not determine dispatch.
 
 ## 2,048-token decode after a large prefill
 
@@ -29,8 +29,6 @@ The depth column is llama-bench's pre-generation context depth. “Total context
 At 128K total context, the custom result is 45% faster than the FP16/FP16 reference and 61% faster than the original mixed-cache path (based on the reported means). The 2K decode demonstrates sustained long-context generation, not only a short first-token/steady-state sample.
 
 A separate 128-token run at 130,944 prefill depth measured 13.71 ± 0.58 tok/s for FP16/FP16, 11.40 ± 0.82 for original FP16/Q8_0, and 20.59 ± 0.21 for the custom path. It is separate from the 2K decode table and should not be directly compared as the same benchmark workload.
-
-The updated loader split was also checked with 2,048 generated tokens after a 65,536-token prefill, using `batch 4096` and `ubatch 2048`: custom FP16-K/Q8_0-V measured **23.110 tok/s** and the custom-path-disabled mixed-cache reference measured **16.691 tok/s**. This is one sample per path. The small-query decode tile keeps the original 8-value Q8 loader; the wider loader is compiled for prefill tiles.
 
 ## Local-window prefill status
 
