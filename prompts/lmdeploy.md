@@ -2,6 +2,8 @@
 
 Port the Volta FP16-K/Q8_0-V tiled attention algorithm in this repository to LMDeploy's relevant runtime. Read the root README, benchmark caveats, and reference patch before modifying code.
 
+
+**Default dispatch policy:** Implement hybrid dispatch rather than forcing the custom kernel for every workload. On the measured Qwen3.8 V100 shape (D=256, GQA=6), the custom FP16-K/Q8_0-V path won for decode and 32K prefill, while the engine's standard mixed-cache path beat forced custom at 64K and longer prefill. In llama.cpp, supported decode and shorter-prefill work use the custom path; for this shape, batched prefill falls back when query rows exceed 8 and KV length is at least 65,536. Treat 64K as a conservative measured guard, not a universal crossover: benchmark this engine's cache layout and choose its own cutoff. After correctness and matched prefill/decode checks pass, make hybrid dispatch the default on supported SM70 shapes; retain an opt-out and native fallback.
 1. Inspect the current LMDeploy revision and distinguish TurboMind from the PyTorch engine. Identify which path supports SM70, which owns attention kernels, and how the paged KV cache and block allocation are implemented.
 2. Examine existing KV quantization formats and scale packing. The target is Q8_0's 32 int8 values plus FP16 scale per block. Decide whether TurboMind can consume that exact representation without conversion; otherwise add an explicit cache type and allocator path.
 3. Add the kernel at the lowest stable backend interface that retains block-table addressing, tensor-parallel/GQA behavior, stream and graph semantics, and continuous batching. Compute scores from FP16 K, decode V blocks into shared-memory tiles, and carry online softmax state across KV tiles.

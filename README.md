@@ -33,6 +33,12 @@ On V100, the kernel uses the GPU's tensor-core matrix operations for the main at
 
 A useful way to picture the cache: FP16 keys are the index cards used to find relevant pages; Q8_0 values are compact copies of the page contents. The kernel searches with the keys and opens only the value pages needed for each small step.
 
+## Default dispatch policy
+
+Use hybrid dispatch by default on supported SM70 layouts. The measured Qwen3.8 case (D=256, GQA 6) favors the custom path for decode and 32K prefill, while the standard mixed-cache path is faster for prefill at 64K and above. The llama.cpp selector keeps the custom path for supported decode and shorter prefills, then falls back to standard mixed-cache attention when this shape has more than 8 query rows and at least 65,536 KV rows.
+
+Treat 64K as a conservative measured guard, not a universal crossover: only 32K and 64K bracketed the prefill comparison. When porting to another engine or model shape, benchmark matched prefill and decode workloads and set an engine-specific cutoff. After correctness and performance checks pass, make the hybrid selector the default; retain a runtime opt-out and the engine's native fallback.
+
 ## Prefill results
 
 Prefill uses `batch 4096` and `ubatch 2048`. The latest two-run measurements show the new path winning at 32K; at 64K and above, the standard mixed-cache path is faster, so the default dispatcher switches back to it.
